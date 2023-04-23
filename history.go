@@ -1,12 +1,8 @@
 package readline
 
 import (
-	"bufio"
 	"container/list"
 	"fmt"
-	"os"
-	"strings"
-	"sync"
 )
 
 type hisItem struct {
@@ -20,13 +16,18 @@ func (h *hisItem) Clean() {
 	h.Tmp = nil
 }
 
+type HistoryWriter interface {
+	Load() ([][]rune, error)
+	Append([]rune) error
+	Close() error
+}
+
 type opHistory struct {
 	cfg        *Config
 	history    *list.List
 	historyVer int64
 	current    *list.Element
-	fd         *os.File
-	fdLock     sync.Mutex
+	writer     HistoryWriter
 	enable     bool
 }
 
@@ -45,53 +46,42 @@ func (o *opHistory) Reset() {
 }
 
 func (o *opHistory) IsHistoryClosed() bool {
-	o.fdLock.Lock()
-	defer o.fdLock.Unlock()
-	return o.fd.Fd() == ^(uintptr(0))
+	return (o.writer == nil)
 }
 
-func (o *opHistory) Init() {
+func (o *opHistory) Init() (err error) {
 	if o.IsHistoryClosed() {
-		o.initHistory()
+		err = o.initHistory()
 	}
+	return
 }
 
-func (o *opHistory) initHistory() {
-	if o.cfg.HistoryFile != "" {
-		o.historyUpdatePath(o.cfg.HistoryFile)
-	}
-}
+func (o *opHistory) initHistory() error {
 
-// only called by newOpHistory
-func (o *opHistory) historyUpdatePath(path string) {
-	o.fdLock.Lock()
-	defer o.fdLock.Unlock()
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	switch {
+	case o.cfg.HistoryWrite != nil:
+		o.writer = o.cfg.HistoryWrite
+	case o.cfg.HistoryFile == "":
+		return nil
+	default:
+		o.writer = NewHistoryFile(o.cfg.HistoryFile, o.cfg.HistoryLimit)
+	}
+
+	lines, err := o.writer.Load()
+
 	if err != nil {
-		return
+		return err
 	}
-	o.fd = f
-	r := bufio.NewReader(o.fd)
-	total := 0
-	for ; ; total++ {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			break
-		}
-		// ignore the empty line
-		line = strings.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		o.Push([]rune(line))
+
+	for _, line := range lines {
+		o.Push(line)
 		o.Compact()
 	}
-	if total > o.cfg.HistoryLimit {
-		o.rewriteLocked()
-	}
+
 	o.historyVer++
 	o.Push(nil)
-	return
+
+	return nil
 }
 
 func (o *opHistory) Compact() {
@@ -100,47 +90,10 @@ func (o *opHistory) Compact() {
 	}
 }
 
-func (o *opHistory) Rewrite() {
-	o.fdLock.Lock()
-	defer o.fdLock.Unlock()
-	o.rewriteLocked()
-}
-
-func (o *opHistory) rewriteLocked() {
-	if o.cfg.HistoryFile == "" {
-		return
-	}
-
-	tmpFile := o.cfg.HistoryFile + ".tmp"
-	fd, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0666)
-	if err != nil {
-		return
-	}
-
-	buf := bufio.NewWriter(fd)
-	for elem := o.history.Front(); elem != nil; elem = elem.Next() {
-		buf.WriteString(string(elem.Value.(*hisItem).Source) + "\n")
-	}
-	buf.Flush()
-
-	// replace history file
-	if err = os.Rename(tmpFile, o.cfg.HistoryFile); err != nil {
-		fd.Close()
-		return
-	}
-
-	if o.fd != nil {
-		o.fd.Close()
-	}
-	// fd is write only, just satisfy what we need.
-	o.fd = fd
-}
-
 func (o *opHistory) Close() {
-	o.fdLock.Lock()
-	defer o.fdLock.Unlock()
-	if o.fd != nil {
-		o.fd.Close()
+	if o.writer != nil {
+		o.writer.Close()
+		o.writer = nil
 	}
 }
 
@@ -299,8 +252,6 @@ func (o *opHistory) Revert() {
 }
 
 func (o *opHistory) Update(s []rune, commit bool) (err error) {
-	o.fdLock.Lock()
-	defer o.fdLock.Unlock()
 	s = runes.Copy(s)
 	if o.current == nil {
 		o.Push(s)
@@ -311,9 +262,9 @@ func (o *opHistory) Update(s []rune, commit bool) (err error) {
 	r.Version = o.historyVer
 	if commit {
 		r.Source = s
-		if o.fd != nil {
+		if o.writer != nil {
 			// just report the error
-			_, err = o.fd.Write([]byte(string(r.Source) + "\n"))
+			err = o.writer.Append(r.Source)
 		}
 	} else {
 		r.Tmp = append(r.Tmp[:0], s...)
